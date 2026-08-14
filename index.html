@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>IRR Investment Tracker</title>
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%23101826'/%3E%3Ctext x='50' y='62' font-size='42' text-anchor='middle' fill='%23E3A857' font-family='sans-serif' font-weight='bold'%3E%25%3C/text%3E%3C/svg%3E" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="theme-color" content="#101826" />
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Sora:wght@600;700;800&family=Inter:wght@400;500;600;700&display=swap');
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; background: #101826; font-family: 'Inter', sans-serif; }
+  input[type=date]::-webkit-calendar-picker-indicator { filter: invert(1); }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+    "firebase/app": "https://esm.sh/firebase@10.12.0/app",
+    "firebase/auth": "https://esm.sh/firebase@10.12.0/auth",
+    "firebase/firestore": "https://esm.sh/firebase@10.12.0/firestore"
+  }
+}
+</script>
+
+<!-- Babel must load BEFORE the app script below so it can transpile the JSX -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react" data-type="module">
+import React, { useState, useEffect, useMemo, useCallback } from "react";
+import { createRoot } from "react-dom/client";
+import { initializeApp } from "firebase/app";
+import {
+  getAuth, onAuthStateChanged, createUserWithEmailAndPassword,
+  signInWithEmailAndPassword, signOut,
+} from "firebase/auth";
+import {
+  getFirestore, collection, doc, addDoc, updateDoc, deleteDoc,
+  setDoc, onSnapshot, query,
+} from "firebase/firestore";
+
+// ====================================================================
+// 1. FIREBASE CONFIG — replace with YOUR project's config values.
+//    Get these from: Firebase Console → Project Settings → General
+//    → "Your apps" → Web app → SDK setup and configuration.
+// ====================================================================
+const firebaseConfig = {
+  apiKey: "AIzaSyCzDBIE2Z9Ar-VnJHicgH3TcqnO9T9T-aA",
+  authDomain: "finance-ad6f9.firebaseapp.com",
+  projectId: "finance-ad6f9",
+  storageBucket: "finance-ad6f9.firebasestorage.app",
+  messagingSenderId: "28115127871",
+  appId: "1:28115127871:web:d1485b079b291d26b6328a",
+  measurementId: "G-L3C717MQK4",
+};
+
+const fbApp = initializeApp(firebaseConfig);
+const auth = getAuth(fbApp);
+const db = getFirestore(fbApp);
+
+// ==================== Design tokens ====================
+const C = {
+  bg: "#101826", card: "#182236", cardAlt: "#1F2A40", raised: "#243250",
+  text: "#F4F6FA", sub: "#8B96AC", faint: "#5D677E",
+  gold: "#E3A857", pos: "#3FBF7F", neg: "#E2604F", divider: "#26314A",
+};
+const TYPES = {
+  investment: { label: "Investment", sign: -1, color: C.neg },
+  divestment: { label: "Divestment", sign: 1, color: C.pos },
+  dividend: { label: "Dividend", sign: 1, color: C.pos },
+};
+const todayStr = () => new Date().toISOString().slice(0, 10);
+function fmtINR(n) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  const neg = n < 0;
+  const v = Math.abs(n).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return (neg ? "-₹" : "₹") + v;
+}
+function fmtPct(n) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  return (n >= 0 ? "+" : "") + (n * 100).toFixed(2) + "%";
+}
+function fmtDate(d) {
+  return new Date(d + "T00:00:00").toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+}
+function daysBetween(a, b) { return (b.getTime() - a.getTime()) / 86400000; }
+function xnpv(rate, flows, t0) {
+  return flows.reduce((acc, f) => acc + f.amount / Math.pow(1 + rate, daysBetween(t0, f.date) / 365), 0);
+}
+function xirr(flows) {
+  if (flows.length < 2) return null;
+  const t0 = new Date(Math.min(...flows.map((f) => f.date.getTime())));
+  let low = -0.9999, high = 10;
+  let fLow = xnpv(low, flows, t0), fHigh = xnpv(high, flows, t0);
+  let tries = 0;
+  while (fLow * fHigh > 0 && tries < 60) { high *= 1.5; fHigh = xnpv(high, flows, t0); tries++; }
+  if (fLow * fHigh > 0) return null;
+  let mid = 0;
+  for (let i = 0; i < 200; i++) {
+    mid = (low + high) / 2;
+    const fMid = xnpv(mid, flows, t0);
+    if (Math.abs(fMid) < 1e-7) break;
+    if (fLow * fMid < 0) { high = mid; fHigh = fMid; } else { low = mid; fLow = fMid; }
+  }
+  return mid;
+}
+function computeEngine(entries, hurdleRate) {
+  const sorted = [...entries].sort((a, b) => (a.date === b.date ? a.createdAt - b.createdAt : a.date < b.date ? -1 : 1));
+  let runningVal = null, runningValDate = null;
+  const processed = sorted.map((e) => {
+    if (e.valuation !== null && e.valuation !== undefined && e.valuation !== "") runningVal = e.valuation;
+    runningValDate = e.date;
+    return { ...e, effectiveValuation: runningVal, effectiveValuationDate: runningValDate };
+  });
+  const currentValuation = runningVal ?? 0;
+  const valuationDate = runningValDate ?? todayStr();
+  const valDateObj = new Date(valuationDate + "T00:00:00");
+  const txns = processed.filter((e) => e.type !== "valuation");
+  const cfRows = txns.map((e) => {
+    const cf = TYPES[e.type].sign * e.amount;
+    const hurdleCF = -cf;
+    const dateObj = new Date(e.date + "T00:00:00");
+    const days = daysBetween(dateObj, valDateObj);
+    const hurdleContribution = hurdleCF * (Math.pow(1 + hurdleRate, days / 365) - 1);
+    return { ...e, cf, dateObj, days, hurdleContribution };
+  });
+  const totalInvestments = cfRows.filter((r) => r.type === "investment").reduce((a, r) => a + r.amount, 0);
+  const totalDivestments = cfRows.filter((r) => r.type === "divestment").reduce((a, r) => a + r.amount, 0);
+  const totalDividends = cfRows.filter((r) => r.type === "dividend").reduce((a, r) => a + r.amount, 0);
+  const netCapitalInvested = totalInvestments - totalDivestments - totalDividends;
+  const actualGain = currentValuation + totalDivestments + totalDividends - totalInvestments;
+  const absoluteReturn = netCapitalInvested !== 0 ? actualGain / netCapitalInvested : null;
+  const hurdleReturn = cfRows.reduce((a, r) => a + r.hurdleContribution, 0);
+  const hurdleValue = netCapitalInvested + hurdleReturn;
+  const aboveHurdle = currentValuation - hurdleValue;
+  const flows = cfRows.map((r) => ({ date: r.dateObj, amount: r.cf }));
+  if (currentValuation) flows.push({ date: valDateObj, amount: currentValuation });
+  const irr = flows.length >= 2 ? xirr(flows) : null;
+  let cum = 0;
+  const spark = cfRows.map((r) => { cum += r.cf * -1; return cum; });
+  return { processed, cfRows, currentValuation, valuationDate, totalInvestments, totalDivestments,
+    totalDividends, netCapitalInvested, actualGain, absoluteReturn, hurdleReturn, hurdleValue, aboveHurdle, irr, spark };
+}
+
+// ==================== Auth screen ====================
+function AuthScreen() {
+  const [mode, setMode] = useState("login");
+  const [email, setEmail] = useState("");
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    setErr(null); setBusy(true);
+    try {
+      if (mode === "login") await signInWithEmailAndPassword(auth, email, pw);
+      else await createUserWithEmailAndPassword(auth, email, pw);
+    } catch (e) { setErr(e.message.replace("Firebase: ", "")); }
+    setBusy(false);
+  };
+
+  return (
+    <div style={{ background: C.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Inter',sans-serif" }}>
+      <div style={{ width: "100%", maxWidth: "360px", padding: "24px" }}>
+        <div style={{ fontFamily: "'Sora',sans-serif", color: C.text, fontSize: "26px", fontWeight: 800, marginBottom: "4px" }}>IRR Tracker</div>
+        <div style={{ color: C.sub, fontSize: "13px", marginBottom: "28px" }}>{mode === "login" ? "Log in to your ledger" : "Create your account"}</div>
+        <input type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)}
+          style={{ background: C.card, color: C.text, border: `1px solid ${C.divider}`, borderRadius: "10px", padding: "12px", width: "100%", marginBottom: "10px", fontSize: "15px" }} />
+        <input type="password" placeholder="Password" value={pw} onChange={(e) => setPw(e.target.value)}
+          style={{ background: C.card, color: C.text, border: `1px solid ${C.divider}`, borderRadius: "10px", padding: "12px", width: "100%", marginBottom: "14px", fontSize: "15px" }} />
+        {err && <div style={{ color: C.neg, fontSize: "12px", marginBottom: "12px" }}>{err}</div>}
+        <button onClick={submit} disabled={busy} style={{ background: C.gold, color: "#101826", border: "none", borderRadius: "10px", padding: "13px", width: "100%", fontWeight: 700, fontSize: "15px" }}>
+          {busy ? "…" : mode === "login" ? "Log In" : "Sign Up"}
+        </button>
+        <button onClick={() => setMode(mode === "login" ? "signup" : "login")} style={{ background: "none", border: "none", color: C.sub, fontSize: "13px", marginTop: "16px", width: "100%" }}>
+          {mode === "login" ? "New here? Create an account" : "Already have an account? Log in"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ==================== Main app (ported from prototype, now Firestore-backed) ====================
+function MainApp({ user }) {
+  const [entries, setEntries] = useState([]);
+  const [hurdleRate, setHurdleRate] = useState(0.075);
+  const [view, setView] = useState("dashboard");
+  const [modal, setModal] = useState(null);
+  const [filterType, setFilterType] = useState("all");
+  const [sortDesc, setSortDesc] = useState(true);
+
+  useEffect(() => {
+    const entriesCol = collection(db, "users", user.uid, "entries");
+    const unsubE = onSnapshot(query(entriesCol), (snap) => {
+      setEntries(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    });
+    const settingsRef = doc(db, "users", user.uid, "settings", "config");
+    const unsubS = onSnapshot(settingsRef, (snap) => {
+      if (snap.exists() && snap.data().hurdleRate != null) setHurdleRate(snap.data().hurdleRate);
+    });
+    return () => { unsubE(); unsubS(); };
+  }, [user.uid]);
+
+  const saveEntry = async (entry) => {
+    const { id, ...data } = entry;
+    if (id) await updateDoc(doc(db, "users", user.uid, "entries", id), data);
+    else await addDoc(collection(db, "users", user.uid, "entries"), { ...data, createdAt: Date.now() });
+    setModal(null);
+  };
+  const deleteEntry = async (id) => { await deleteDoc(doc(db, "users", user.uid, "entries", id)); };
+  const persistHurdle = async (rate) => {
+    setHurdleRate(rate);
+    await setDoc(doc(db, "users", user.uid, "settings", "config"), { hurdleRate: rate }, { merge: true });
+  };
+  const resetAll = async () => {
+    for (const e of entries) await deleteDoc(doc(db, "users", user.uid, "entries", e.id));
+    await persistHurdle(0.075);
+  };
+
+  const metrics = useMemo(() => computeEngine(entries, hurdleRate), [entries, hurdleRate]);
+
+  return (
+    <div style={{ background: C.bg, minHeight: "100vh", fontFamily: "'Inter', sans-serif", color: C.text }}>
+      <div style={{ maxWidth: "480px", margin: "0 auto", position: "relative", minHeight: "100vh" }}>
+        <div style={{ paddingBottom: "88px" }}>
+          {view === "dashboard" && <Dashboard metrics={metrics} hurdleRate={hurdleRate} />}
+          {view === "history" && (
+            <HistoryView rows={metrics.cfRows} filterType={filterType} setFilterType={setFilterType}
+              sortDesc={sortDesc} setSortDesc={setSortDesc}
+              onEdit={(e) => setModal({ entry: e })} onDelete={deleteEntry} />
+          )}
+          {view === "settings" && (
+            <SettingsView hurdleRate={hurdleRate} setHurdleRate={persistHurdle}
+              onUpdateValuation={(valuation, date) => saveEntry({ type: "valuation", amount: 0, valuation, date })}
+              onReset={resetAll} currentValuation={metrics.currentValuation} valuationDate={metrics.valuationDate}
+              userEmail={user.email} />
+          )}
+        </div>
+        <button onClick={() => setModal({ entry: null })}
+          style={{ background: C.gold, position: "fixed", bottom: "84px", right: "24px", width: "56px", height: "56px", borderRadius: "50%", border: "none", display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 8px 24px rgba(0,0,0,0.4)" }}>
+          <span style={{ fontSize: "28px", color: "#101826", fontWeight: 700, lineHeight: 0 }}>+</span>
+        </button>
+        <div style={{ background: C.card, borderTop: `1px solid ${C.divider}`, position: "fixed", bottom: 0, left: 0, right: 0, maxWidth: "480px", margin: "0 auto", display: "flex" }}>
+          <NavBtn label="Dashboard" active={view === "dashboard"} onClick={() => setView("dashboard")} />
+          <NavBtn label="History" active={view === "history"} onClick={() => setView("history")} />
+          <NavBtn label="Settings" active={view === "settings"} onClick={() => setView("settings")} />
+        </div>
+      </div>
+      {modal && <TransactionModal initial={modal.entry} onSave={saveEntry} onClose={() => setModal(null)}
+        onDelete={modal.entry ? () => { deleteEntry(modal.entry.id); setModal(null); } : null} />}
+    </div>
+  );
+}
+
+function NavBtn({ label, active, onClick }) {
+  return (
+    <button onClick={onClick} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: "4px", padding: "12px 0", background: "none", border: "none" }}>
+      <div style={{ color: active ? C.gold : C.faint, fontSize: "10px", fontWeight: 700 }}>{label}</div>
+    </button>
+  );
+}
+function Sparkline({ data }) {
+  if (!data || data.length < 2) return null;
+  const min = Math.min(...data, 0), max = Math.max(...data, 0), range = max - min || 1, w = 300, h = 60;
+  const pts = data.map((v, i) => `${(i / (data.length - 1)) * w},${h - ((v - min) / range) * h}`);
+  return <svg viewBox={`0 0 ${w} ${h}`} width="100%" height="60" preserveAspectRatio="none">
+    <polyline points={pts.join(" ")} fill="none" stroke={C.gold} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" opacity="0.9" /></svg>;
+}
+function Dashboard({ metrics, hurdleRate }) {
+  return (
+    <div style={{ padding: "32px 20px 0" }}>
+      <div style={{ color: C.sub, letterSpacing: "0.08em", fontSize: "12px", fontWeight: 600, textTransform: "uppercase", marginBottom: "4px" }}>Current Valuation</div>
+      <div style={{ fontFamily: "'Sora',sans-serif", fontSize: "36px", fontWeight: 800, marginBottom: "4px" }}>{fmtINR(metrics.currentValuation)}</div>
+      <div style={{ color: C.faint, fontSize: "12px", marginBottom: "12px" }}>as of {fmtDate(metrics.valuationDate)}</div>
+      <div style={{ background: C.card, borderRadius: "16px", padding: "12px", marginBottom: "24px" }}><Sparkline data={metrics.spark} /></div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "24px" }}>
+        <HeroCard label="XIRR" value={fmtPct(metrics.irr)} accent={C.gold} />
+        <HeroCard label="Absolute Return" value={fmtPct(metrics.absoluteReturn)} accent={metrics.absoluteReturn >= 0 ? C.pos : C.neg} />
+        <HeroCard label="Actual Gain" value={fmtINR(metrics.actualGain)} accent={metrics.actualGain >= 0 ? C.pos : C.neg} />
+        <HeroCard label="Net Invested" value={fmtINR(metrics.netCapitalInvested)} accent={C.text} />
+      </div>
+      <div style={{ background: C.card, borderRadius: "16px", overflow: "hidden", marginBottom: "24px" }}>
+        <DetailRow label="Hurdle Rate" value={(hurdleRate * 100).toFixed(2) + "%"} />
+        <DetailRow label="Minimum Required Value" value={fmtINR(metrics.hurdleValue)} />
+        <DetailRow label={metrics.aboveHurdle >= 0 ? "Above Hurdle" : "Below Hurdle"} value={fmtINR(metrics.aboveHurdle)} valueColor={metrics.aboveHurdle >= 0 ? C.pos : C.neg} />
+        <DetailRow label="Total Dividends" value={fmtINR(metrics.totalDividends)} last />
+      </div>
+      <div style={{ background: C.card, borderRadius: "16px", overflow: "hidden", marginBottom: "24px" }}>
+        <DetailRow label="Total Investments" value={fmtINR(metrics.totalInvestments)} />
+        <DetailRow label="Total Divestments" value={fmtINR(metrics.totalDivestments)} last />
+      </div>
+    </div>
+  );
+}
+function HeroCard({ label, value, accent }) {
+  return (
+    <div style={{ background: C.card, borderRadius: "16px", padding: "16px" }}>
+      <div style={{ color: C.sub, fontSize: "11px", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: "8px" }}>{label}</div>
+      <div style={{ fontFamily: "'Sora',sans-serif", color: accent, fontSize: "20px", fontWeight: 700 }}>{value}</div>
+    </div>
+  );
+}
+function DetailRow({ label, value, valueColor, last }) {
+  return (
+    <div style={{ borderBottom: last ? "none" : `1px solid ${C.divider}`, display: "flex", justifyContent: "space-between", padding: "14px 16px" }}>
+      <div style={{ color: C.sub, fontSize: "14px" }}>{label}</div>
+      <div style={{ color: valueColor || C.text, fontFamily: "'Sora',sans-serif", fontSize: "14px", fontWeight: 700 }}>{value}</div>
+    </div>
+  );
+}
+function HistoryView({ rows, filterType, setFilterType, sortDesc, setSortDesc, onEdit, onDelete }) {
+  const filtered = rows.filter((r) => filterType === "all" || r.type === filterType)
+    .sort((a, b) => (sortDesc ? (a.date < b.date ? 1 : -1) : a.date < b.date ? -1 : 1));
+  return (
+    <div style={{ padding: "32px 20px 0" }}>
+      <div style={{ fontFamily: "'Sora',sans-serif", fontSize: "24px", fontWeight: 800, marginBottom: "16px" }}>Transaction History</div>
+      <div style={{ display: "flex", gap: "8px", marginBottom: "16px" }}>
+        <select value={filterType} onChange={(e) => setFilterType(e.target.value)}
+          style={{ background: C.card, color: C.text, border: `1px solid ${C.divider}`, borderRadius: "8px", padding: "8px 12px", fontSize: "14px", flex: 1 }}>
+          <option value="all">All Types</option><option value="investment">Investment</option>
+          <option value="divestment">Divestment</option><option value="dividend">Dividend</option>
+        </select>
+        <button onClick={() => setSortDesc(!sortDesc)} style={{ background: C.card, border: `1px solid ${C.divider}`, color: C.sub, borderRadius: "8px", padding: "8px 12px", fontSize: "14px" }}>
+          {sortDesc ? "Newest" : "Oldest"}
+        </button>
+      </div>
+      {filtered.length === 0 && <div style={{ color: C.faint, textAlign: "center", fontSize: "14px", padding: "48px 0" }}>No transactions yet.</div>}
+      <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+        {filtered.map((r) => (
+          <div key={r.id} style={{ background: C.card, borderRadius: "14px", padding: "16px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <span style={{ background: TYPES[r.type].color + "22", color: TYPES[r.type].color, fontSize: "10px", fontWeight: 700, textTransform: "uppercase", padding: "4px 8px", borderRadius: "999px" }}>{TYPES[r.type].label}</span>
+                <span style={{ color: C.faint, fontSize: "12px" }}>{fmtDate(r.date)}</span>
+              </div>
+              <div style={{ display: "flex", gap: "10px" }}>
+                <button onClick={() => onEdit(r)} style={{ background: "none", border: "none", color: C.sub, fontSize: "13px" }}>Edit</button>
+                <button onClick={() => onDelete(r.id)} style={{ background: "none", border: "none", color: C.neg, fontSize: "13px" }}>Delete</button>
+              </div>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <div><div style={{ color: C.sub, fontSize: "11px" }}>Amount</div><div style={{ fontFamily: "'Sora',sans-serif", fontWeight: 700, fontSize: "15px" }}>{fmtINR(r.amount)}</div></div>
+              <div style={{ textAlign: "right" }}><div style={{ color: C.sub, fontSize: "11px" }}>Cash Flow</div><div style={{ color: TYPES[r.type].color, fontFamily: "'Sora',sans-serif", fontWeight: 700, fontSize: "15px" }}>{fmtINR(r.cf)}</div></div>
+            </div>
+            {r.effectiveValuation != null && (
+              <div style={{ borderTop: `1px solid ${C.divider}`, color: C.faint, marginTop: "8px", paddingTop: "8px", fontSize: "11px", display: "flex", justifyContent: "space-between" }}>
+                <span>Valuation: {fmtINR(r.effectiveValuation)}</span><span>{fmtDate(r.effectiveValuationDate)}</span>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+function SettingsView({ hurdleRate, setHurdleRate, onUpdateValuation, onReset, currentValuation, valuationDate, userEmail }) {
+  const [valInput, setValInput] = useState("");
+  const [valDate, setValDate] = useState(todayStr());
+  const [saved, setSaved] = useState(false);
+  return (
+    <div style={{ padding: "32px 20px 0" }}>
+      <div style={{ fontFamily: "'Sora',sans-serif", fontSize: "24px", fontWeight: 800, marginBottom: "4px" }}>Settings</div>
+      <div style={{ color: C.faint, fontSize: "12px", marginBottom: "20px" }}>{userEmail}</div>
+      <div style={{ background: C.card, borderRadius: "16px", padding: "16px", marginBottom: "20px" }}>
+        <div style={{ color: C.sub, fontSize: "12px", fontWeight: 600, textTransform: "uppercase", marginBottom: "8px" }}>Hurdle Rate</div>
+        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+          <input type="number" step="0.1" value={(hurdleRate * 100).toFixed(2)} onChange={(e) => setHurdleRate((parseFloat(e.target.value) || 0) / 100)}
+            style={{ background: C.cardAlt, color: C.text, border: `1px solid ${C.divider}`, borderRadius: "8px", padding: "10px 12px", fontSize: "18px", fontWeight: 700, flex: 1 }} />
+          <span style={{ color: C.sub, fontSize: "18px", fontWeight: 700 }}>%</span>
+        </div>
+      </div>
+      <div style={{ background: C.card, borderRadius: "16px", padding: "16px", marginBottom: "20px" }}>
+        <div style={{ color: C.sub, fontSize: "12px", fontWeight: 600, textTransform: "uppercase", marginBottom: "8px" }}>Update Current Valuation</div>
+        <div style={{ color: C.faint, fontSize: "12px", marginBottom: "12px" }}>Latest known: {fmtINR(currentValuation)} as of {fmtDate(valuationDate)}</div>
+        <input type="number" placeholder="Valuation amount" value={valInput} onChange={(e) => setValInput(e.target.value)}
+          style={{ background: C.cardAlt, color: C.text, border: `1px solid ${C.divider}`, borderRadius: "8px", padding: "10px 12px", fontSize: "14px", width: "100%", marginBottom: "8px" }} />
+        <input type="date" value={valDate} onChange={(e) => setValDate(e.target.value)}
+          style={{ background: C.cardAlt, color: C.text, border: `1px solid ${C.divider}`, borderRadius: "8px", padding: "10px 12px", fontSize: "14px", width: "100%", marginBottom: "12px" }} />
+        <button onClick={() => { const v = parseFloat(valInput); if (!v) return; onUpdateValuation(v, valDate); setValInput(""); setSaved(true); setTimeout(() => setSaved(false), 1500); }}
+          style={{ background: C.gold, color: "#101826", border: "none", borderRadius: "8px", padding: "12px", width: "100%", fontWeight: 700, fontSize: "14px" }}>
+          {saved ? "Saved" : "Save Valuation"}
+        </button>
+      </div>
+      <button onClick={() => { if (confirm("Clear all transactions and reset settings?")) onReset(); }}
+        style={{ color: C.neg, border: `1px solid ${C.neg}44`, background: "none", borderRadius: "8px", padding: "12px", width: "100%", fontWeight: 600, fontSize: "14px", marginBottom: "12px" }}>
+        Clear All Data
+      </button>
+      <button onClick={() => signOut(auth)} style={{ color: C.sub, border: `1px solid ${C.divider}`, background: "none", borderRadius: "8px", padding: "12px", width: "100%", fontWeight: 600, fontSize: "14px" }}>
+        Log Out
+      </button>
+    </div>
+  );
+}
+function TransactionModal({ initial, onSave, onClose, onDelete }) {
+  const [date, setDate] = useState(initial?.date || todayStr());
+  const [type, setType] = useState(initial?.type && initial.type !== "valuation" ? initial.type : "investment");
+  const [amount, setAmount] = useState(initial?.amount ? String(initial.amount) : "");
+  const [valuation, setValuation] = useState(initial?.valuation != null ? String(initial.valuation) : "");
+  const [err, setErr] = useState(null);
+  const submit = () => {
+    const amt = parseFloat(amount);
+    if (!date || !amt || amt <= 0) { setErr("Enter a valid date and amount."); return; }
+    onSave({ id: initial?.id, date, type, amount: amt, valuation: valuation !== "" ? parseFloat(valuation) : null });
+  };
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 50, display: "flex", alignItems: "flex-end", justifyContent: "center", background: "#000000aa" }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ background: C.card, borderTopLeftRadius: "24px", borderTopRightRadius: "24px", width: "100%", maxWidth: "480px", padding: "20px", paddingBottom: "32px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "20px" }}>
+          <div style={{ fontFamily: "'Sora',sans-serif", fontSize: "18px", fontWeight: 700 }}>{initial ? "Edit Transaction" : "Add Transaction"}</div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: C.sub, fontSize: "20px" }}>×</button>
+        </div>
+        <Label>Date</Label>
+        <input type="date" value={date} onChange={(e) => setDate(e.target.value)}
+          style={{ background: C.cardAlt, color: C.text, border: `1px solid ${C.divider}`, borderRadius: "8px", padding: "12px", fontSize: "16px", width: "100%", marginBottom: "16px" }} />
+        <Label>Type</Label>
+        <div style={{ display: "flex", gap: "8px", marginBottom: "16px" }}>
+          {Object.entries(TYPES).map(([key, t]) => (
+            <button key={key} onClick={() => setType(key)}
+              style={{ background: type === key ? t.color : C.cardAlt, color: type === key ? "#101826" : C.sub, border: `1px solid ${type === key ? t.color : C.divider}`, borderRadius: "8px", padding: "10px", flex: 1, fontWeight: 700, fontSize: "14px" }}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+        <Label>Amount</Label>
+        <input type="number" inputMode="decimal" placeholder="0.00" value={amount} onChange={(e) => setAmount(e.target.value)}
+          style={{ background: C.cardAlt, color: C.text, border: `1px solid ${C.divider}`, borderRadius: "8px", padding: "12px", fontSize: "16px", width: "100%", marginBottom: "16px" }} />
+        <Label>Current Valuation (optional)</Label>
+        <input type="number" inputMode="decimal" placeholder="Leave blank to carry forward" value={valuation} onChange={(e) => setValuation(e.target.value)}
+          style={{ background: C.cardAlt, color: C.text, border: `1px solid ${C.divider}`, borderRadius: "8px", padding: "12px", fontSize: "16px", width: "100%", marginBottom: "8px" }} />
+        {err && <div style={{ color: C.neg, fontSize: "12px", marginBottom: "12px" }}>{err}</div>}
+        <button onClick={submit} style={{ background: C.gold, color: "#101826", border: "none", borderRadius: "8px", padding: "14px", width: "100%", fontWeight: 700, fontSize: "16px", marginTop: "8px" }}>Save Transaction</button>
+        {onDelete && <button onClick={onDelete} style={{ background: "none", border: "none", color: C.neg, padding: "12px", width: "100%", fontWeight: 600, fontSize: "14px", marginTop: "4px" }}>Delete Transaction</button>}
+      </div>
+    </div>
+  );
+}
+function Label({ children }) {
+  return <div style={{ color: C.sub, fontSize: "11px", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: "6px" }}>{children}</div>;
+}
+
+// ==================== Root: auth gate ====================
+function Root() {
+  const [user, setUser] = useState(undefined); // undefined = loading, null = signed out
+  useEffect(() => onAuthStateChanged(auth, setUser), []);
+  if (user === undefined) {
+    return <div style={{ background: C.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: C.sub }}>Loading…</div>;
+  }
+  return user ? <MainApp user={user} /> : <AuthScreen />;
+}
+
+createRoot(document.getElementById("root")).render(<Root />);
+</script>
+</body>
+</html>
