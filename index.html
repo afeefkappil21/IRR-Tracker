@@ -24,10 +24,27 @@
     "react": "https://esm.sh/react@18.3.1",
     "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
     "firebase/app": "https://esm.sh/firebase@10.12.0/app",
-    "firebase/auth": "https://esm.sh/firebase@10.12.0/auth",
-    "firebase/firestore": "https://esm.sh/firebase@10.12.0/firestore"
+    "firebase/auth": "https://esm.sh/firebase@10.12.0/auth?external=firebase/app",
+    "firebase/firestore": "https://esm.sh/firebase@10.12.0/firestore?external=firebase/app"
   }
 }
+</script>
+
+<!-- Shows any JS error directly on the page — needed since mobile Safari has no visible console -->
+<script>
+  window.addEventListener("error", function (e) {
+    document.getElementById("root").innerHTML =
+      '<pre style="color:#ff8080;background:#101826;padding:20px;white-space:pre-wrap;font-family:monospace;font-size:13px;">JS ERROR:\n' +
+      (e.message || "") + "\n" + (e.error && e.error.stack ? e.error.stack : "") +
+      "</pre>";
+  });
+  window.addEventListener("unhandledrejection", function (e) {
+    document.getElementById("root").innerHTML =
+      '<pre style="color:#ff8080;background:#101826;padding:20px;white-space:pre-wrap;font-family:monospace;font-size:13px;">PROMISE ERROR:\n' +
+      (e.reason && e.reason.message ? e.reason.message : String(e.reason)) +
+      (e.reason && e.reason.stack ? "\n" + e.reason.stack : "") +
+      "</pre>";
+  });
 </script>
 
 <!-- Babel must load BEFORE the app script below so it can transpile the JSX -->
