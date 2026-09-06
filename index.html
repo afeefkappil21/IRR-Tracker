@@ -57,7 +57,7 @@ import { createRoot } from "react-dom/client";
 import { initializeApp } from "firebase/app";
 import {
   getAuth, onAuthStateChanged, createUserWithEmailAndPassword,
-  signInWithEmailAndPassword, signOut,
+  signInWithEmailAndPassword, signOut, sendPasswordResetEmail,
 } from "firebase/auth";
 import {
   getFirestore, collection, doc, addDoc, updateDoc, deleteDoc,
@@ -171,17 +171,22 @@ function computeEngine(entries, hurdleRate) {
 
 // ==================== Auth screen ====================
 function AuthScreen() {
-  const [mode, setMode] = useState("login");
+  const [mode, setMode] = useState("login"); // "login" | "signup" | "reset"
   const [email, setEmail] = useState("");
   const [pw, setPw] = useState("");
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [resetSent, setResetSent] = useState(false);
 
   const submit = async () => {
     setErr(null); setBusy(true);
     try {
       if (mode === "login") await signInWithEmailAndPassword(auth, email, pw);
-      else await createUserWithEmailAndPassword(auth, email, pw);
+      else if (mode === "signup") await createUserWithEmailAndPassword(auth, email, pw);
+      else {
+        await sendPasswordResetEmail(auth, email);
+        setResetSent(true);
+      }
     } catch (e) { setErr(e.message.replace("Firebase: ", "")); }
     setBusy(false);
   };
@@ -190,17 +195,39 @@ function AuthScreen() {
     <div style={{ background: C.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Inter',sans-serif" }}>
       <div style={{ width: "100%", maxWidth: "360px", padding: "24px" }}>
         <div style={{ fontFamily: "'Sora',sans-serif", color: C.text, fontSize: "26px", fontWeight: 800, marginBottom: "4px" }}>IRR Tracker</div>
-        <div style={{ color: C.sub, fontSize: "13px", marginBottom: "28px" }}>{mode === "login" ? "Log in to your ledger" : "Create your account"}</div>
-        <input type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)}
-          style={{ background: C.card, color: C.text, border: `1px solid ${C.divider}`, borderRadius: "10px", padding: "12px", width: "100%", marginBottom: "10px", fontSize: "15px" }} />
-        <input type="password" placeholder="Password" value={pw} onChange={(e) => setPw(e.target.value)}
-          style={{ background: C.card, color: C.text, border: `1px solid ${C.divider}`, borderRadius: "10px", padding: "12px", width: "100%", marginBottom: "14px", fontSize: "15px" }} />
-        {err && <div style={{ color: C.neg, fontSize: "12px", marginBottom: "12px" }}>{err}</div>}
-        <button onClick={submit} disabled={busy} style={{ background: C.gold, color: "#101826", border: "none", borderRadius: "10px", padding: "13px", width: "100%", fontWeight: 700, fontSize: "15px" }}>
-          {busy ? "…" : mode === "login" ? "Log In" : "Sign Up"}
-        </button>
-        <button onClick={() => setMode(mode === "login" ? "signup" : "login")} style={{ background: "none", border: "none", color: C.sub, fontSize: "13px", marginTop: "16px", width: "100%" }}>
-          {mode === "login" ? "New here? Create an account" : "Already have an account? Log in"}
+        <div style={{ color: C.sub, fontSize: "13px", marginBottom: "28px" }}>
+          {mode === "login" ? "Log in to your ledger" : mode === "signup" ? "Create your account" : "Reset your password"}
+        </div>
+
+        {mode === "reset" && resetSent ? (
+          <div style={{ color: C.pos, fontSize: "14px", marginBottom: "16px" }}>
+            Check your inbox — a password reset link has been sent to {email}.
+          </div>
+        ) : (
+          <>
+            <input type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)}
+              style={{ background: C.card, color: C.text, border: `1px solid ${C.divider}`, borderRadius: "10px", padding: "12px", width: "100%", marginBottom: "10px", fontSize: "15px" }} />
+            {mode !== "reset" && (
+              <input type="password" placeholder="Password" value={pw} onChange={(e) => setPw(e.target.value)}
+                style={{ background: C.card, color: C.text, border: `1px solid ${C.divider}`, borderRadius: "10px", padding: "12px", width: "100%", marginBottom: "14px", fontSize: "15px" }} />
+            )}
+            {err && <div style={{ color: C.neg, fontSize: "12px", marginBottom: "12px" }}>{err}</div>}
+            <button onClick={submit} disabled={busy} style={{ background: C.gold, color: "#101826", border: "none", borderRadius: "10px", padding: "13px", width: "100%", fontWeight: 700, fontSize: "15px" }}>
+              {busy ? "…" : mode === "login" ? "Log In" : mode === "signup" ? "Sign Up" : "Send Reset Link"}
+            </button>
+          </>
+        )}
+
+        {mode === "login" && (
+          <button onClick={() => { setMode("reset"); setErr(null); setResetSent(false); }}
+            style={{ background: "none", border: "none", color: C.sub, fontSize: "13px", marginTop: "14px", width: "100%" }}>
+            Forgot password?
+          </button>
+        )}
+
+        <button onClick={() => { setMode(mode === "login" ? "signup" : "login"); setErr(null); setResetSent(false); }}
+          style={{ background: "none", border: "none", color: C.sub, fontSize: "13px", marginTop: "8px", width: "100%" }}>
+          {mode === "signup" ? "Already have an account? Log in" : mode === "reset" ? "Back to log in" : "New here? Create an account"}
         </button>
       </div>
     </div>
