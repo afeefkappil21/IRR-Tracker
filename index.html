@@ -143,7 +143,9 @@ function computeEngine(entries, hurdleRate) {
   const txns = processed.filter((e) => e.type !== "valuation");
   const cfRows = txns.map((e) => {
     const cf = TYPES[e.type].sign * e.amount;
-    const hurdleCF = -cf;
+    // Hurdle/Net-Invested base excludes dividends — they aren't invested capital,
+    // so dividend entries contribute zero hurdle growth.
+    const hurdleCF = e.type === "dividend" ? 0 : -cf;
     const dateObj = new Date(e.date + "T00:00:00");
     const days = daysBetween(dateObj, valDateObj);
     const hurdleContribution = hurdleCF * (Math.pow(1 + hurdleRate, days / 365) - 1);
@@ -152,7 +154,7 @@ function computeEngine(entries, hurdleRate) {
   const totalInvestments = cfRows.filter((r) => r.type === "investment").reduce((a, r) => a + r.amount, 0);
   const totalDivestments = cfRows.filter((r) => r.type === "divestment").reduce((a, r) => a + r.amount, 0);
   const totalDividends = cfRows.filter((r) => r.type === "dividend").reduce((a, r) => a + r.amount, 0);
-  const netCapitalInvested = totalInvestments - totalDivestments - totalDividends;
+  const netCapitalInvested = totalInvestments - totalDivestments; // dividends excluded from invested-capital base
   const actualGain = currentValuation + totalDivestments + totalDividends - totalInvestments;
   const absoluteReturn = netCapitalInvested !== 0 ? actualGain / netCapitalInvested : null;
   const hurdleReturn = cfRows.reduce((a, r) => a + r.hurdleContribution, 0);
